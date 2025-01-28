@@ -1,13 +1,3 @@
-= Big Data Infrastructure Exercises
-
-We'll use this repository through our course.
-Starting it from a small application to have something
-bigger and more complex.
-
-You'll learn to develop an API, the common intrface between software systems,
-package it and deploy it to the cloud (AWS) and finally how we can scale
-and better automate the data-intensive parts.
-
 == Installation
 
 * Use python 3.11 or 3.12

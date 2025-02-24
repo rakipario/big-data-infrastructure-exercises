@@ -1,8 +1,16 @@
+import concurrent.futures
 import os
-from typing import Annotated
+import time
+from typing import Annotated, List, Dict
 
-from fastapi import APIRouter, status
-from fastapi.params import Query
+import duckdb as db
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import requests
+import ujson
+from bs4 import BeautifulSoup
+from fastapi import APIRouter, status, Query, HTTPException
 
 from bdi_api.settings import Settings
 
@@ -17,6 +25,24 @@ s1 = APIRouter(
     tags=["s1"],
 )
 
+# Helper function to clean directories
+def clean_directory(directory: str) -> None:
+    """Cleans the given directory by removing its contents."""
+    if os.path.exists(directory):
+        for file in os.listdir(directory):
+            os.remove(os.path.join(directory, file))
+    os.makedirs(directory, exist_ok=True)
+
+# Helper function to download a single file
+def download_file(base_url: str, file: str, download_dir: str) -> None:
+    """Downloads a single file and saves it to the specified directory."""
+    try:
+        response = requests.get(base_url + file)
+        response.raise_for_status()
+        with open(os.path.join(download_dir, file[:-3]), "wb") as f:
+            f.write(response.content)
+    except requests.RequestException as e:
+        print(f"Failed to download {file}: {e}")
 
 @s1.post("/aircraft/download")
 def download_data(
@@ -32,77 +58,130 @@ def download_data(
         ),
     ] = 100,
 ) -> str:
-    """Downloads the `file_limit` files AS IS inside the folder data/20231101
-
-    data: https://samples.adsbexchange.com/readsb-hist/2023/11/01/
-    documentation: https://www.adsbexchange.com/version-2-api-wip/
-        See "Trace File Fields" section
-
-    Think about the way you organize the information inside the folder
-    and the level of preprocessing you might need.
-
-    To manipulate the data use any library you feel comfortable with.
-    Just make sure to configure it in the `pyproject.toml` file
-    so it can be installed using `poetry update`.
-
-
-    TIP: always clean the download folder before writing again to avoid having old files.
-    """
+    """Downloads the `file_limit` files AS IS inside the folder data/20231101."""
     download_dir = os.path.join(settings.raw_dir, "day=20231101")
     base_url = settings.source_url + "/2023/11/01/"
-    # TODO Implement download
 
-    return "OK"
+    # Clean the download directory
+    clean_directory(download_dir)
 
+    # Fetch the list of files from the server
+    try:
+        response = requests.get(base_url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        file_links = [a['href'] for a in soup.find_all("a") if a["href"].endswith(".json.gz")][:file_limit]
+    except requests.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch file list: {e}")
+
+    # Download files in parallel
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = [executor.submit(download_file, base_url, file, download_dir) for file in file_links]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()  # Ensure all downloads complete
+
+    return f"Downloaded {len(file_links)} files to {download_dir}"
+
+# Helper function to process a single file
+def process_file(file_path: str) -> pd.DataFrame:
+    """Processes a single file and returns a DataFrame."""
+    with open(file_path) as f:
+        data = ujson.load(f)
+
+    if 'aircraft' not in data:
+        print(f"File {file_path} does not contain aircraft data")
+        return pd.DataFrame()
+
+    timestamp = data['now']
+    df = pd.DataFrame(data['aircraft'])
+    df_new = pd.DataFrame()
+
+    # Extract relevant fields
+    df_new['altitude_baro'] = df['alt_baro'].replace({'ground': 0})
+    df_new['had_emergency'] = df['emergency'].apply(lambda x: x not in ["none", None])
+    df_new['icao'] = df.get('hex', None)
+    df_new['registration'] = df.get('r', None)
+    df_new['type'] = df.get('t', None)
+    df_new['lat'] = df.get('lat', None)
+    df_new['lon'] = df.get('lon', None)
+    df_new['ground_speed'] = df.get('gs', None)
+    df_new['timestamp'] = timestamp
+
+    return df_new
 
 @s1.post("/aircraft/prepare")
 def prepare_data() -> str:
-    """Prepare the data in the way you think it's better for the analysis.
+    """Prepares the data for analysis by processing raw files and saving them in Parquet format."""
+    raw_dir = os.path.join(settings.raw_dir, "day=20231101")
+    prepared_dir = os.path.join(settings.prepared_dir, "day=20231101")
+    prepare_file_path = os.path.join(prepared_dir, 'aircraft_data.parquet')
 
-    * data: https://samples.adsbexchange.com/readsb-hist/2023/11/01/
-    * documentation: https://www.adsbexchange.com/version-2-api-wip/
-        See "Trace File Fields" section
+    # Clean the prepared directory
+    clean_directory(prepared_dir)
 
-    Think about the way you organize the information inside the folder
-    and the level of preprocessing you might need.
+    # Process files in parallel
+    files = [os.path.join(raw_dir, file) for file in os.listdir(raw_dir)]
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        results = list(executor.map(process_file, files))
 
-    To manipulate the data use any library you feel comfortable with.
-    Just make sure to configure it in the `pyproject.toml` file
-    so it can be installed using `poetry update`.
+    # Combine results into a single Parquet file
+    tables = [pa.Table.from_pandas(df) for df in results if not df.empty]
+    if tables:
+        schema = tables[0].schema
+        tables = [table.cast(schema) for table in tables]
+        table = pa.concat_tables(tables)
+        pq.write_table(table, prepare_file_path)
 
-    TIP: always clean the prepared folder before writing again to avoid having old files.
-
-    Keep in mind that we are downloading a lot of small files, and some libraries might not work well with this!
-    """
-    # TODO
-    return "OK"
-
+    return f"Data preparation complete. Saved to {prepare_file_path}"
 
 @s1.get("/aircraft/")
-def list_aircraft(num_results: int = 100, page: int = 0) -> list[dict]:
-    """List all the available aircraft, its registration and type ordered by
-    icao asc
-    """
-    # TODO
-    return [{"icao": "0d8300", "registration": "YV3382", "type": "LJ31"}]
+def list_aircraft(num_results: int = 100, page: int = 0) -> List[Dict]:
+    """Lists all available aircraft, ordered by ICAO."""
+    prepared_dir = os.path.join(settings.prepared_dir, "day=20231101")
+    prepare_file_path = os.path.join(prepared_dir, 'aircraft_data.parquet')
 
+    query = f"""
+        SELECT DISTINCT icao, registration, type
+        FROM '{prepare_file_path}'
+        ORDER BY icao ASC
+        LIMIT {num_results}
+        OFFSET {page * num_results}
+    """
+    result = db.query(query).df()
+    return result.to_dict(orient='records')
 
 @s1.get("/aircraft/{icao}/positions")
-def get_aircraft_position(icao: str, num_results: int = 1000, page: int = 0) -> list[dict]:
-    """Returns all the known positions of an aircraft ordered by time (asc)
-    If an aircraft is not found, return an empty list.
-    """
-    # TODO implement and return a list with dictionaries with those values.
-    return [{"timestamp": 1609275898.6, "lat": 30.404617, "lon": -86.476566}]
+def get_aircraft_position(icao: str, num_results: int = 1000, page: int = 0) -> List[Dict]:
+    """Returns all known positions of an aircraft, ordered by timestamp."""
+    prepared_dir = os.path.join(settings.prepared_dir, "day=20231101")
+    prepare_file_path = os.path.join(prepared_dir, 'aircraft_data.parquet')
 
+    query = f"""
+        SELECT timestamp, lat, lon
+        FROM '{prepare_file_path}'
+        WHERE icao = '{icao}'
+        AND lat IS NOT NULL
+        AND lon IS NOT NULL
+        ORDER BY timestamp ASC
+        LIMIT {num_results}
+        OFFSET {page * num_results}
+    """
+    result = db.query(query).df()
+    return result.to_dict(orient='records')
 
 @s1.get("/aircraft/{icao}/stats")
-def get_aircraft_statistics(icao: str) -> dict:
-    """Returns different statistics about the aircraft
+def get_aircraft_statistics(icao: str) -> Dict:
+    """Returns statistics about the aircraft."""
+    prepared_dir = os.path.join(settings.prepared_dir, "day=20231101")
+    prepare_file_path = os.path.join(prepared_dir, 'aircraft_data.parquet')
 
-    * max_altitude_baro
-    * max_ground_speed
-    * had_emergency
+    query = f"""
+        SELECT
+            MAX(altitude_baro) AS max_altitude_baro,
+            MAX(ground_speed) AS max_ground_speed,
+            MAX(had_emergency) AS had_emergency
+        FROM '{prepare_file_path}'
+        WHERE icao = '{icao}'
     """
-    # TODO Gather and return the correct statistics for the requested aircraft
-    return {"max_altitude_baro": 300000, "max_ground_speed": 493, "had_emergency": False}
+    result = db.query(query).df()
+    return result.to_dict(orient='records')[0]

@@ -2,6 +2,7 @@ import concurrent.futures
 import os
 import time
 from typing import Annotated, List, Dict
+from io import BytesIO
 
 import duckdb as db
 import pandas as pd
@@ -25,7 +26,6 @@ s1 = APIRouter(
     tags=["s1"],
 )
 
-# Helper function to clean directories
 def clean_directory(directory: str) -> None:
     """Cleans the given directory by removing its contents."""
     if os.path.exists(directory):
@@ -33,14 +33,21 @@ def clean_directory(directory: str) -> None:
             os.remove(os.path.join(directory, file))
     os.makedirs(directory, exist_ok=True)
 
-# Helper function to download a single file
 def download_file(base_url: str, file: str, download_dir: str) -> None:
-    """Downloads a single file and saves it to the specified directory."""
+    """Downloads a single file and saves it decompressed if necessary."""
     try:
-        response = requests.get(base_url + file)
+        response = requests.get(base_url + file, timeout=10)
         response.raise_for_status()
-        with open(os.path.join(download_dir, file[:-3]), "wb") as f:
-            f.write(response.content)
+        content = response.content
+        output_path = os.path.join(download_dir, file[:-3])
+        if content.startswith(b'\x1f\x8b'):  # Gzip magic bytes
+            import gzip
+            with gzip.open(BytesIO(content), 'rb') as gz:
+                with open(output_path, 'wb') as f:
+                    f.write(gz.read())
+        else:
+            with open(output_path, 'wb') as f:
+                f.write(content)
     except requests.RequestException as e:
         print(f"Failed to download {file}: {e}")
 
@@ -62,31 +69,31 @@ def download_data(
     download_dir = os.path.join(settings.raw_dir, "day=20231101")
     base_url = settings.source_url + "/2023/11/01/"
 
-    # Clean the download directory
     clean_directory(download_dir)
 
-    # Fetch the list of files from the server
     try:
-        response = requests.get(base_url)
+        response = requests.get(base_url, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         file_links = [a['href'] for a in soup.find_all("a") if a["href"].endswith(".json.gz")][:file_limit]
     except requests.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch file list: {e}")
 
-    # Download files in parallel
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [executor.submit(download_file, base_url, file, download_dir) for file in file_links]
         for future in concurrent.futures.as_completed(futures):
-            future.result()  # Ensure all downloads complete
+            future.result()
 
     return f"Downloaded {len(file_links)} files to {download_dir}"
 
-# Helper function to process a single file
 def process_file(file_path: str) -> pd.DataFrame:
     """Processes a single file and returns a DataFrame."""
-    with open(file_path) as f:
-        data = ujson.load(f)
+    try:
+        with open(file_path) as f:
+            data = ujson.load(f)
+    except (ujson.JSONDecodeError, ValueError) as e:
+        print(f"Skipping {file_path}: Invalid JSON ({e})")
+        return pd.DataFrame()
 
     if 'aircraft' not in data:
         print(f"File {file_path} does not contain aircraft data")
@@ -96,7 +103,6 @@ def process_file(file_path: str) -> pd.DataFrame:
     df = pd.DataFrame(data['aircraft'])
     df_new = pd.DataFrame()
 
-    # Extract relevant fields
     df_new['altitude_baro'] = df['alt_baro'].replace({'ground': 0})
     df_new['had_emergency'] = df['emergency'].apply(lambda x: x not in ["none", None])
     df_new['icao'] = df.get('hex', None)
@@ -116,21 +122,20 @@ def prepare_data() -> str:
     prepared_dir = os.path.join(settings.prepared_dir, "day=20231101")
     prepare_file_path = os.path.join(prepared_dir, 'aircraft_data.parquet')
 
-    # Clean the prepared directory
     clean_directory(prepared_dir)
 
-    # Process files in parallel
     files = [os.path.join(raw_dir, file) for file in os.listdir(raw_dir)]
     with concurrent.futures.ProcessPoolExecutor() as executor:
         results = list(executor.map(process_file, files))
 
-    # Combine results into a single Parquet file
     tables = [pa.Table.from_pandas(df) for df in results if not df.empty]
     if tables:
         schema = tables[0].schema
         tables = [table.cast(schema) for table in tables]
         table = pa.concat_tables(tables)
         pq.write_table(table, prepare_file_path)
+    else:
+        print("No valid data to process")
 
     return f"Data preparation complete. Saved to {prepare_file_path}"
 
@@ -177,11 +182,11 @@ def get_aircraft_statistics(icao: str) -> Dict:
 
     query = f"""
         SELECT
-            MAX(altitude_baro) AS max_altitude_baro,
-            MAX(ground_speed) AS max_ground_speed,
-            MAX(had_emergency) AS had_emergency
+            COALESCE(MAX(altitude_baro), 0) AS max_altitude_baro,
+            COALESCE(MAX(ground_speed), 0) AS max_ground_speed,
+            COALESCE(CAST(MAX(had_emergency) AS BOOLEAN), FALSE) AS had_emergency
         FROM '{prepare_file_path}'
         WHERE icao = '{icao}'
     """
     result = db.query(query).df()
-    return result.to_dict(orient='records')[0]
+    return result.to_dict(orient='records')[0] if not result.empty else {"max_altitude_baro": 0, "max_ground_speed": 0, "had_emergency": False}

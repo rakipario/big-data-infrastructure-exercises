@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+psycopg
+psycopg_pool
+boto3
+requests
+pydantic
+pydantic-settings
+python-dotenv

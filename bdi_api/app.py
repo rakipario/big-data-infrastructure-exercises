@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-import uptrace
+# import uptrace
 from fastapi import FastAPI
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from starlette import status
@@ -14,6 +14,7 @@ from bdi_api.examples import v0_router
 # from bdi_api.s1.exercise import s1
 from bdi_api.s1.exercise import s1
 from bdi_api.s4.exercise import s4
+from bdi_api.s8.exercise import s8
 from bdi_api.settings import Settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -65,6 +66,7 @@ if settings.telemetry:
 app.include_router(v0_router)
 app.include_router(s1)
 app.include_router(s4)
+app.include_router(s8)
 
 
 @app.get("/health", status_code=200)

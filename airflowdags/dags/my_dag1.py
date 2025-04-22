@@ -1,6 +1,5 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
 from datetime import datetime, timedelta
 import requests
 import json
@@ -27,16 +26,24 @@ s3_client = boto3.client(
 # PostgreSQL connection pool
 pool = ConnectionPool(
     conninfo=f"""
-        dbname={db_credentials.DB_NAME}
-        user={db_credentials.DB_USER}
-        password={db_credentials.DB_PASSWORD}
-        host={db_credentials.DB_HOST}
-        port={db_credentials.DB_PORT}
+        dbname=postgres
+        user={db_credentials.username}
+        password={db_credentials.password}
+        host={db_credentials.host}
+        port={db_credentials.port}
     """,
-    max_size=20,
+    min_size=4,
+    max_size=50,  # Increased from 20 to 50
     max_lifetime=600,
-    timeout=10
+    timeout=30,  # Increased from 10 to 30 seconds
 )
+
+# Check and repair pool connections
+def check_pool_connections():
+    try:
+        pool.check()  # Verify and repair stale connections
+    except Exception as e:
+        print(f"Pool check failed: {e}")
 
 def process_aircraft_data(data: dict) -> list:
     """Process raw aircraft data into a list of tuples for database insertion."""
@@ -73,6 +80,7 @@ def prepare_readsb_hist_data(**context):
     execution_date = context['execution_date'].replace(day=1)
     day_str = execution_date.strftime('%Y/%m/%d')
     total_records = 0
+    check_pool_connections()  # Check connections before task
     with pool.connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
@@ -112,7 +120,7 @@ with DAG(
         'retries': 1,
         'retry_delay': timedelta(minutes=5),
     },
-    schedule_interval='@monthly',
+    schedule='@monthly',
     start_date=datetime(2023, 11, 1),
     end_date=datetime(2024, 11, 1),
     catchup=True,
@@ -120,12 +128,10 @@ with DAG(
     download_task = PythonOperator(
         task_id='download_readsb_hist',
         python_callable=download_readsb_hist_data,
-        provide_context=True,
     )
     prepare_task = PythonOperator(
         task_id='prepare_readsb_hist',
         python_callable=prepare_readsb_hist_data,
-        provide_context=True,
     )
     download_task >> prepare_task
 
@@ -147,8 +153,8 @@ with DAG(
         'retries': 1,
         'retry_delay': timedelta(minutes=5),
     },
-    schedule_interval='@once',
-    start_date=days_ago(1),
+    schedule='@once',
+    start_date=datetime(2023, 11, 1),
     catchup=False,
 ) as dag:
     download_fuel_task = PythonOperator(
@@ -158,6 +164,7 @@ with DAG(
 
 # DAG 3: Aircraft Database
 def download_aircraft_database():
+    check_pool_connections()  # Check connections before task
     url = "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv"
     response = requests.get(url)
     data = response.text
@@ -199,8 +206,8 @@ with DAG(
         'retries': 1,
         'retry_delay': timedelta(minutes=5),
     },
-    schedule_interval='@weekly',
-    start_date=days_ago(1),
+    schedule='@weekly',
+    start_date=datetime(2023, 11, 1),
     catchup=False,
 ) as dag:
     download_aircraft_db_task = PythonOperator(
